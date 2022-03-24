@@ -8,5 +8,9 @@ archive/*
 solver/*
 */.ipynb_checkpoints/*
 data/fplreview.csv
+data/allsvenskan_xpts.csv
 data/login.json
+data/allsvenskanlogin.json
+data/team.json
+data/allsvenskanteam.json
 run/results/*.csv

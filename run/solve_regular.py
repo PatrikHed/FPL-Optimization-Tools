@@ -12,11 +12,11 @@ if __name__=="__main__":
     with open('regular_settings.json') as f:
         options = json.load(f)
 
-    session, team_id = connect()
+    session, team_id = connect(options)
     if session is None and team_id is None:
         exit(0)
     elif team_id is None:
-        with open('team.json') as f:
+         with open(options.get("team_json",'../data/team.json')) as f:
             my_data = json.load(f)
     else:
         my_data = get_my_data(session, team_id)

@@ -1,5 +1,10 @@
 {
-    "horizon": 5,
+    "api_base": "https://fantasy.allsvenskan.se",
+    "xPts_file_path": "../data/allsvenskan_xpts.csv",
+    "team_json": "../data/allsvenskanteam.json",
+    "login_json": "../data/allsvenskanlogin.json",
+    "login_url": "https://fantasy.allsvenskan.se/api/player/login/",
+    "horizon": 3,
     "ft_value": 1.5,
     "itb_value": 0.08,
     "no_future_transfer": false,
@@ -14,6 +19,9 @@
     "use_wc": null,
     "use_bb": null,
     "use_fh": null,
-    "chip_limits": {"bb": 0, "wc": 0, "fh": 0, "tc": 0},
+    "use_lr": null,
+    "use_2c": null,
+    "use_ptb": null,
+    "chip_limits": {"bb": 0, "wc": 0, "fh": 0, "tc": 0, "lr":0, "2c":0, "ptb":0},
     "booked_transfers": []
 }
