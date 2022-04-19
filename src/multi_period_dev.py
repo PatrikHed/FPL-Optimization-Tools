@@ -53,6 +53,8 @@ def connect(options):
         r = session.get('https://fantasy.premierleague.com/api/me/')
         if r.status_code != 200:
             raise ValueError('Cannot read data')
+        if r.json()['player'] is None:
+            return [session, None]
     return [session, r.json()['player']['entry']]
 
 
@@ -198,6 +200,7 @@ def solve_multi_period_fpl(data, options):
     squad = model.add_variables(players, all_gw, name='squad', vartype=so.binary)
     squad_fh = model.add_variables(players, gameweeks, name='squad_fh', vartype=so.binary)
     squad_lr = model.add_variables(players, gameweeks, name='squad_lr', vartype=so.binary)
+    ptb_ind = model.add_variables(players, gameweeks, vartype=so.binary, name='ptb_ind')
 
     lineup = model.add_variables(players, gameweeks, name='lineup', vartype=so.binary)
     captain = model.add_variables(players, gameweeks, name='captain', vartype=so.binary)
@@ -247,6 +250,11 @@ def solve_multi_period_fpl(data, options):
     number_of_transfers = {w: so.expr_sum(transfer_out[p,w] for p in players) for w in gameweeks}
     number_of_transfers[next_gw-1] = 1
     transfer_diff = {w: number_of_transfers[w] - free_transfers[w] - 15 * use_wc[w] for w in gameweeks}
+    
+    #ptb constraints
+    model.add_constraints((ptb_ind[p,w] <= (use_ptb[w] if merged_data.loc[p, 'element_type'] == 2 else 0) for p in players for w in gameweeks), name='ptb_leq_chip')
+    model.add_constraints((ptb_ind[p,w] <= (lineup[p,w] if merged_data.loc[p, 'element_type'] == 2 else 0) for p in players for w in gameweeks), name='ptb_leq_selection')
+    model.add_constraints((ptb_ind[p,w] + 1 >= lineup[p,w] + (use_ptb[w] if merged_data.loc[p, 'element_type'] == 2 else 0) for p in players for w in gameweeks), name='ptb_lb')
 
     # Initial conditions
     model.add_constraints((squad[p, next_gw-1] == 1 for p in initial_squad), name='initial_squad_players')
@@ -345,6 +353,13 @@ def solve_multi_period_fpl(data, options):
         locked_players = options['locked']
         model.add_constraints((squad[p,w] == 1 for p in locked_players for w in gameweeks), name='lock_player')
 
+    if options.get('max_gk_cost', None) is not None:
+        max_gk_cost = options['max_gk_cost']
+        model.add_constraints((so.expr_sum(buy_price[p] * squad[p,w] if player_type[p] == 1 else 0 for p in players) <= max_gk_cost for w in gameweeks), name='max_gk_cost_constraint')
+    if options.get('wc_before', None) is not None:
+        wc_before = options['wc_before']
+        model.add_constraint((so.expr_sum(use_wc[w] for w in range(2, wc_before)) == 1), name='wc_before_constraint')
+        
     if options.get("no_future_transfer"):
         model.add_constraint(so.expr_sum(transfer_in[p,w] for p in players for w in gameweeks if w > next_gw and w != options.get('use_wc')) == 0, name='no_future_transfer')
 
@@ -371,7 +386,7 @@ def solve_multi_period_fpl(data, options):
                                  name=f'booked_transfer_out_{transfer_gw}_{player_out}')
 
     # Objectives
-    gw_xp = {w: so.expr_sum(points_player_week[p,w] * (lineup[p,w] + captain[p,w] + 0.1*vicecap[p,w] + (lineup[p,w] if merged_data.loc[p, 'element_type'] == 2 and use_ptb[w] == 1 else 0) + so.expr_sum(bench_weights[o] * bench[p,w,o] for o in order)) for p in players) for w in gameweeks}
+    gw_xp = {w: so.expr_sum(points_player_week[p,w] * (lineup[p,w] + captain[p,w] + 0.1*vicecap[p,w] + ptb_ind[p,w] + so.expr_sum(bench_weights[o] * bench[p,w,o] for o in order)) for p in players) for w in gameweeks}    
     gw_total = {w: gw_xp[w] - 4 * penalized_transfers[w] + ft_value * free_transfers[w] + itb_value * in_the_bank[w] for w in gameweeks}
     if objective == 'regular':
         total_xp = so.expr_sum(gw_total[w] for w in gameweeks)
@@ -440,10 +455,10 @@ def solve_multi_period_fpl(data, options):
                 xp_cont = points_player_week[p,w] * multiplier
                 
                 picks.append([
-                    w, lp['web_name'], position, lp['element_type'], lp['name'], player_buy_price, player_sell_price, round(points_player_week[p,w],2), minutes_player_week[p,w], is_squad, is_lineup, bench_value, is_captain, is_vice, is_transfer_in, is_transfer_out, multiplier, xp_cont
+                    w, lp['web_name'], position, lp['element_type'], lp['name'], player_buy_price, player_sell_price, round(points_player_week[p,w],2), minutes_player_week[p,w], is_squad, is_lineup, bench_value, is_captain, is_vice, is_transfer_in, is_transfer_out, multiplier, xp_cont, ptb_ind[p,w].get_value()
                 ])
 
-    picks_df = pd.DataFrame(picks, columns=['week', 'name', 'pos', 'type', 'team', 'buy_price', 'sell_price', 'xP', 'xMin', 'squad', 'lineup', 'bench', 'captain', 'vicecaptain', 'transfer_in', 'transfer_out', 'multiplier', 'xp_cont']).sort_values(by=['week', 'lineup', 'type', 'xP'], ascending=[True, False, True, True])
+    picks_df = pd.DataFrame(picks, columns=['week', 'name', 'pos', 'type', 'team', 'buy_price', 'sell_price', 'xP', 'xMin', 'squad', 'lineup', 'bench', 'captain', 'vicecaptain', 'transfer_in', 'transfer_out', 'multiplier', 'xp_cont', 'ptb_ind']).sort_values(by=['week', 'lineup', 'type', 'xP'], ascending=[True, False, True, True])
     total_xp = so.expr_sum((lineup[p,w] + captain[p,w]) * points_player_week[p,w] for p in players for w in gameweeks).get_value()
 
     picks_df.sort_values(by=['week', 'squad', 'lineup', 'bench', 'type'], ascending=[True, False, False, True, True], inplace=True)
