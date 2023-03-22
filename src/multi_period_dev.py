@@ -87,7 +87,6 @@ def prep_data(my_data, options):
     data_weights = options.get('data_weights', {'review': 100})
 
     data = read_data(options, datasource, data_weights)
-    print(data.head())
     data = data.fillna(0)
     if 'ID' in data:
         data['review_id'] = data['ID']
@@ -99,7 +98,6 @@ def prep_data(my_data, options):
 
     merged_data = pd.merge(elements_team, data, left_on='id_x', right_on='review_id')
     merged_data.set_index(['id_x'], inplace=True)
-    print(merged_data.head())
     # Check if data exists
     for week in range(gw, min(39, gw+horizon)):
         if f'{week}_Pts' not in data.keys():
@@ -204,7 +202,7 @@ def solve_multi_period_fpl(data, options):
     horizon = options.get('horizon', 3)
     objective = options.get('objective', 'decay')
     decay_base = options.get('decay_base', 0.84)
-    bench_weights = options.get('bench_weights', {0: 0.03, 1: 0.21, 2: 0.06, 3: 0.002})
+    bench_weights = options.get('bench_weights', {0: 0.03, 1: 0.15, 2: 0.05, 3: 0.002})
     bench_weights = {int(key): value for (key,value) in bench_weights.items()}
     # wc_limit = options.get('wc_limit', 0)
     ft_value = options.get('ft_value', 1.5)
@@ -326,7 +324,7 @@ def solve_multi_period_fpl(data, options):
     model.add_constraints((lineup[p,w] <= squad_fh[p,w] + 1 - use_fh[w] for p in players for w in gameweeks), name='lineup_squad_fh_rel')
     model.add_constraints((bench[p,w,o] <= squad_fh[p,w] + 1 - use_fh[w] for p in players for w in gameweeks for o in order), name='bench_squad_fh_rel')
     model.add_constraints((lineup[p,w] <= squad_lr[p,w] + 1  - use_lr[w] for p in players for w in gameweeks), name='lineup_squad_lr_rel')
-    model.add_constraints((bench[p,w,o] <= squad_lr[p,w] + 1  - use_lr[w] for p in players for w in gameweeks for o in order), name='bench_squad_lr_rel')    
+    model.add_constraints((bench[p,w,o] <= squad_lr[p,w] + 1  - use_lr[w] for p in players for w in gameweeks for o in order), name='bench_squad_lr_rel')   
     model.add_constraints((captain[p,w] <= lineup[p,w] for p in players for w in gameweeks), name='captain_lineup_rel')
     model.add_constraints((vicecap[p,w] <= lineup[p,w] for p in players for w in gameweeks), name='vicecap_lineup_rel')
     model.add_constraints((captain[p,w] + vicecap[p,w] <= 1 for p in players for w in gameweeks), name='cap_vc_rel')
@@ -614,7 +612,7 @@ def solve_multi_period_fpl(data, options):
         picks = []
         for w in gameweeks:
             for p in players:
-                if squad[p,w].get_value() + squad_fh[p,w].get_value() + transfer_out[p,w].get_value() > 0.5:
+                if squad[p,w].get_value() + squad_fh[p,w].get_value() + squad_lr[p,w].get_value() + transfer_out[p,w].get_value() > 0.5:
                     lp = merged_data.loc[p]
                     is_captain = 1 if captain[p,w].get_value() > 0.5 else 0
                     is_squad = 1 if (use_fh[w].get_value() < 0.5 and squad[p,w].get_value() > 0.5) or (use_fh[w].get_value() > 0.5 and squad_fh[p,w].get_value() > 0.5) else 0
@@ -658,7 +656,7 @@ def solve_multi_period_fpl(data, options):
         cumulative_xpts = 0
         for w in gameweeks:
             summary_of_actions += f"** GW {w}:\n"
-            chip_decision = ("WC" if use_wc[w].get_value() > 0.5 else "") + ("FH" if use_fh[w].get_value() > 0.5 else "") + ("BB" if use_bb[w].get_value() > 0.5 else "")
+            chip_decision = ("WC" if use_wc[w].get_value() > 0.5 else "") + ("FH" if use_fh[w].get_value() > 0.5 else "") + ("BB" if use_bb[w].get_value() > 0.5 else "") + ("LR" if use_lr[w].get_value() > 0.5 else "") + ("2C" if use_2c[w].get_value() > 0.5 else "") + ("PTB" if use_ptb[w].get_value() > 0.5 else "")
             if chip_decision != "":
                 summary_of_actions += "CHIP " + chip_decision + "\n"
             summary_of_actions += f"ITB={in_the_bank[w].get_value()}, FT={free_transfers[w].get_value()}, PT={penalized_transfers[w].get_value()}, NT={number_of_transfers[w].get_value()}\n"
@@ -687,7 +685,9 @@ def solve_multi_period_fpl(data, options):
             for type in [1,2,3,4]:
                 type_players = lineup_players[lineup_players['type'] == type]
                 entries = type_players.apply(get_display, axis=1)
+                print(entries.head())
                 summary_of_actions += '\t' + ', '.join(entries.tolist()) + "\n"
+
             summary_of_actions += "Bench: \n\t" + ', '.join(bench_players['name'].tolist()) + "\n"
             summary_of_actions += "Lineup xPts: " + str(round(lineup_players['xp_cont'].sum(),2)) + "\n---\n\n"
             cumulative_xpts = cumulative_xpts + round(lineup_players['xp_cont'].sum(),2)
@@ -737,30 +737,52 @@ if __name__ == '__main__':
     t0 = time.time()
 
     options = {
-        "api_base": "https://fantasy.allsvenskan.se",
-        "xPts_file_path": "data/allsvenskan_xpts.csv",
-        "team_json": "data/allsvenskanteam.json",
+         "api_base": "https://fantasy.allsvenskan.se",
+        "xPts_file_path": "/data/allsvenskan_xpts.csv",
+        "team_json": "/data/allsvenskanteam.json",
         "login_json": "data/allsvenskanlogin.json",
         "login_url": "https://fantasy.allsvenskan.se/api/player/login/",
-        "horizon":1,
+        "horizon": 8,
         "ft_value": 1.5,
         "itb_value": 0.08,
         "no_future_transfer": False,
+        "no_transfer_last_gws": 2,
         "randomized": False,
+        "xmin_lb": 2,
+        "ev_per_price_cutoff": 20,
         "banned": [],
         "locked": [],
+        "keep": [],
         "delete_tmp": True,
-        "secs": 3600,
+        "single_solve": True,
+        "secs": 300,
+        "gap": 0,
         "use_cmd": True,
         "num_transfers": None,
         "hit_limit": None,
         "use_wc": None,
         "use_bb": None,
         "use_fh": None,
-        "use_lr": None,
-        "use_ptb": None,
+        "use_lr": 2,
         "use_2c": None,
-        "chip_limits": {"bb": 0, "wc": 0, "fh": 0, "tc": 0, "lr":0, "2c":0, "ptb":0}
+        "use_ptb": None,
+        "chip_limits": { "bb": 0, "wc": 0, "fh": 0, "tc": 0, "lr": 1, "2c": 0, "ptb": 0 },
+        "no_chip_gws": [],
+        "allowed_chip_gws": { "bb": [], "wc": [], "fh": [], "tc": [] },
+        "future_transfer_limit": None,
+        "no_transfer_gws": [],
+        "booked_transfers": [],
+        "preseason": True,
+        "use_login": False,
+        "cbc_path": "",
+        "no_opposing_play": False,
+        "pick_prices": { "G": "", "D": "", "M": "", "F": "" },
+        "no_gk_rotation_after": None,
+        "iteration": 1,
+        "iteration_criteria": "this_gw_transfer_in",
+        "datasource": "allfalytics",
+        "data_weights": { "review": 40, "review-odds": 30, "mikkel": 30, "kiwi": 0 },
+        "export_data": "final.csv"
     }
 
     session, team_id = connect(options)
