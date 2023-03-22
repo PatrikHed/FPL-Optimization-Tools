@@ -10,7 +10,7 @@ import json
 from requests import Session
 import random
 import string
-
+from data_parser import read_data
 
 def get_random_id(n):
     return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(n))
@@ -53,9 +53,11 @@ def connect(options):
         r = session.get('https://fantasy.premierleague.com/api/me/')
         if r.status_code != 200:
             raise ValueError('Cannot read data')
-        if r.json()['player'] is None:
-            return [session, None]
-    return [session, r.json()['player']['entry']]
+        try:
+            return [session, r.json()['player']['entry']]
+        except:
+            return [None, None]
+    
 
 
 def get_my_data(session, team_id):
@@ -80,11 +82,28 @@ def prep_data(my_data, options):
     element_data = pd.DataFrame(fpl_data['elements'])
     team_data = pd.DataFrame(fpl_data['teams'])
     elements_team = pd.merge(element_data, team_data, left_on='team', right_on='id')
-    review_data = pd.read_csv(options.get('xPts_file_path', '../data/fplreview.csv'))
-    review_data = review_data.fillna(0)
-    review_data['review_id'] = review_data['ID']
-    merged_data = pd.merge(elements_team, review_data, left_on='id_x', right_on='review_id')
+
+    datasource = options.get('datasource', 'review')
+    data_weights = options.get('data_weights', {'review': 100})
+
+    data = read_data(options, datasource, data_weights)
+    
+    data = data.fillna(0)
+    if 'ID' in data:
+        data['review_id'] = data['ID']
+    else:
+        data['review_id'] = data.index+1
+    
+    if options.get('export_data', '') != '' and datasource == 'mixed':
+        data.to_csv(f"../data/{options['export_data']}")
+
+    merged_data = pd.merge(elements_team, data, left_on='id_x', right_on='review_id')
     merged_data.set_index(['id_x'], inplace=True)
+
+    # Check if data exists
+    for week in range(gw, min(39, gw+horizon)):
+        if f'{week}_Pts' not in data.keys():
+            raise ValueError(f"{week}_Pts is not inside prediction data, change your horizon parameter or update your prediction data")
 
     original_keys = merged_data.columns.to_list()
     keys = [k for k in original_keys if "_Pts" in k]
@@ -96,10 +115,17 @@ def prep_data(my_data, options):
 
     # Filter players by xMin
     initial_squad = [int(i['element']) for i in my_data['picks']]
-    # safe_players = initial_squad + 
     xmin_lb = options.get('xmin_lb', 1)
     print(len(merged_data), "total players (before)")
     merged_data = merged_data[(merged_data['total_min'] >= xmin_lb) | (merged_data['review_id'].isin(initial_squad))].copy()
+
+    # Filter by ev per price
+    ev_per_price_cutoff = options.get('ev_per_price_cutoff', 0)
+    safe_players = initial_squad + options.get('locked', []) + options.get('banned', []) + options.get('keep', [])
+    if ev_per_price_cutoff != 0:
+        cutoff = (merged_data['total_ev'] / merged_data['now_cost']).quantile(ev_per_price_cutoff/100)
+        merged_data = merged_data[(merged_data['total_ev'] / merged_data['now_cost'] > cutoff) | (merged_data['review_id'].isin(safe_players))].copy()
+
     print(len(merged_data), "total players (after)")
 
     if options.get('randomized', False):
@@ -114,15 +140,19 @@ def prep_data(my_data, options):
     buy_price = (merged_data['now_cost']/10).to_dict()
     sell_price = {i['element']: i['selling_price']/10 for i in my_data['picks']}
     price_modified_players = []
-    for i in my_data['picks']:
-        if buy_price[i['element']] != sell_price[i['element']]:
-            price_modified_players.append(i['element'])
-            print(f"Added player {i['element']} to list, buy price {buy_price[i['element']]} sell price {sell_price[i['element']]}")
-
-
+    
+    preseason = options.get('preseason', False)
+    if not preseason:
+        for i in my_data['picks']:
+            if buy_price[i['element']] != sell_price[i['element']]:
+                price_modified_players.append(i['element'])
+                print(f"Added player {i['element']} to list, buy price {buy_price[i['element']]} sell price {sell_price[i['element']]}")
 
     itb = my_data['transfers']['bank']/10
-    ft = 0 if my_data['transfers']['limit'] is None else my_data['transfers']['limit'] - my_data['transfers']['made']
+    if my_data['transfers']['limit'] is None:
+        ft = 1
+    else:
+        ft = my_data['transfers']['limit'] - my_data['transfers']['made']
     if ft < 0:
         ft = 0
     # If wildcard is active, then you have: "status_for_entry": "active" under my_data['chips']
@@ -130,7 +160,14 @@ def prep_data(my_data, options):
         if c['name'] == 'wildcard' and c['status_for_entry'] == 'active':
             ft = 1
             options['use_wc'] = gw
+            if options['chip_limits']['wc'] == 0:
+                options['chip_limits']['wc'] = 1
             break
+
+    # Fixture info
+    team_code_dict = team_data.set_index('id')['name'].to_dict()
+    fixture_data = requests.get('https://fantasy.premierleague.com/api/fixtures/').json()
+    fixtures = [{'gw': f['event'], 'home': team_code_dict[f['team_h']], 'away': team_code_dict[f['team_a']]} for f in fixture_data]
 
     return {
         'merged_data': merged_data,
@@ -143,7 +180,8 @@ def prep_data(my_data, options):
         'buy_price': buy_price,
         'price_modified_players': price_modified_players,
         'itb': itb,
-        'ft': ft
+        'ft': ft,
+        'fixtures': fixtures
         }
 
 
@@ -164,16 +202,20 @@ def solve_multi_period_fpl(data, options):
     # Arguments
     problem_id = get_random_id(5)
     horizon = options.get('horizon', 3)
-    objective = options.get('objective', 'regular')
+    objective = options.get('objective', 'decay')
     decay_base = options.get('decay_base', 0.84)
     bench_weights = options.get('bench_weights', {0: 0.03, 1: 0.21, 2: 0.06, 3: 0.002})
+    bench_weights = {int(key): value for (key,value) in bench_weights.items()}
+    # wc_limit = options.get('wc_limit', 0)
     ft_value = options.get('ft_value', 1.5)
     itb_value = options.get('itb_value', 0.08)
     ft = data.get('ft', 1)
     if ft <= 0:
         ft = 0
     chip_limits = options.get('chip_limits', dict())
+    allowed_chip_gws = options.get('allowed_chip_gws', dict())
     booked_transfers = options.get('booked_transfers', [])
+    preseason = options.get('preseason', False)
 
     # Data
     problem_name = f'mp_h{horizon}_regular' if objective == 'regular' else f'mp_h{horizon}_o{objective[0]}_d{decay_base}'
@@ -183,12 +225,19 @@ def solve_multi_period_fpl(data, options):
     next_gw = data['next_gw']
     initial_squad = data['initial_squad']
     itb = data['itb']
+    fixtures = data['fixtures']
+    if preseason:
+        itb = 100
+        threshold_gw = 2
+    else:
+        threshold_gw = next_gw
 
     # Sets
     players = merged_data.index.to_list()
     element_types = type_data.index.to_list()
     teams = team_data['name'].to_list()
-    gameweeks = list(range(next_gw, next_gw+horizon))
+    last_gw = next_gw + horizon - 1
+    gameweeks = list(range(next_gw, last_gw + 1))
     all_gw = [next_gw-1] + gameweeks
     order = [0, 1, 2, 3]
     price_modified_players = data['price_modified_players']
@@ -299,9 +348,11 @@ def solve_multi_period_fpl(data, options):
     model.add_constraints((transfer_in[p,w] <= 1-use_lr[w] for p in players for w in gameweeks), name='no_tr_in_lr')
     model.add_constraints((transfer_out[p,w] <= 1-use_lr[w] for p in players for w in gameweeks), name='no_tr_out_lr')
     ## Free transfer constraints
-    model.add_constraints((free_transfers[w] == aux[w] + 1 for w in gameweeks if w > next_gw), name='aux_ft_rel')
-    model.add_constraints((free_transfers[w-1] - number_of_transfers[w-1] - 2 * use_wc[w-1] - 2 * use_fh[w-1] - 2 * use_lr[w-1]  <= 2 * aux[w] for w in gameweeks if w > next_gw), name='force_aux_1')
-    model.add_constraints((free_transfers[w-1] - number_of_transfers[w-1] - 2 * use_wc[w-1] - 2 * use_fh[w-1] - 2 * use_lr[w-1] >= aux[w] + (-14)*(1-aux[w]) for w in gameweeks if w > next_gw), name='force_aux_2')
+    model.add_constraints((free_transfers[w] == aux[w] + 1 for w in gameweeks if w > threshold_gw), name='aux_ft_rel')
+    model.add_constraints((free_transfers[w-1] - number_of_transfers[w-1] - 2 * use_wc[w-1] - 2 * use_fh[w-1] - 2 * use_lr[w-1] <= 2 * aux[w] for w in gameweeks if w > threshold_gw), name='force_aux_1')
+    model.add_constraints((free_transfers[w-1] - number_of_transfers[w-1] - 2 * use_wc[w-1] - 2 * use_fh[w-1] - 2 * use_lr[w-1] >= aux[w] + (-14)*(1-aux[w]) for w in gameweeks if w > threshold_gw), name='force_aux_2')
+    if preseason and threshold_gw in gameweeks:
+        model.add_constraint(free_transfers[threshold_gw] == 1, name='ps_initial_ft')
     model.add_constraints((penalized_transfers[w] >= transfer_diff[w] for w in gameweeks), name='pen_transfer_rel')
     ## Chip constraints
     model.add_constraints((use_wc[w] + use_fh[w] + use_bb[w] + use_lr[w] + use_2c[w] + use_ptb[w] <= 1 for w in gameweeks), name='single_chip')
@@ -309,6 +360,16 @@ def solve_multi_period_fpl(data, options):
     model.add_constraints((aux[w] <= 1-use_fh[w-1] for w in gameweeks if w > next_gw), name='ft_after_fh')
     model.add_constraints((aux[w] <= 1-use_lr[w-1] for w in gameweeks if w > next_gw), name='ft_after_lr')
 
+    if options.get('use_wc', None) is not None:
+        model.add_constraint(use_wc[options['use_wc']] == 1, name='force_wc')
+        chip_limits['wc'] = 1
+    if options.get('use_bb', None) is not None:
+        model.add_constraint(use_bb[options['use_bb']] == 1, name='force_bb')
+        chip_limits['bb'] = 1
+    if options.get('use_fh', None) is not None:
+        model.add_constraint(use_fh[options['use_fh']] == 1, name='force_fh')
+        chip_limits['fh'] = 1
+    
     model.add_constraint(so.expr_sum(use_wc[w] for w in gameweeks) <= chip_limits.get('wc', 0), name='use_wc_limit')
     model.add_constraint(so.expr_sum(use_bb[w] for w in gameweeks) <= chip_limits.get('bb', 0), name='use_bb_limit')
     model.add_constraint(so.expr_sum(use_fh[w] for w in gameweeks) <= chip_limits.get('fh', 0), name='use_fh_limit')
@@ -318,24 +379,26 @@ def solve_multi_period_fpl(data, options):
     model.add_constraints((squad_fh[p,w] <= use_fh[w] for p in players for w in gameweeks), name='fh_squad_logic')
     model.add_constraints((squad_lr[p,w] <= use_lr[w] for p in players for w in gameweeks), name='lr_squad_logic')
 
-    if options.get('use_wc', None) is not None:
-        model.add_constraint(use_wc[options['use_wc']] == 1, name='force_wc')
-    if next_gw == 1:
-        model.add_constraint(use_wc[1] == 1, name='force_wc')
-    if options.get('use_bb', None) is not None:
-        model.add_constraint(use_bb[options['use_bb']] == 1, name='force_bb')
-    if options.get('use_fh', None) is not None:
-        model.add_constraint(use_fh[options['use_fh']] == 1, name='force_fh')
     if options.get('use_lr', None) is not None:
         model.add_constraint(use_lr[options['use_lr']] == 1, name='force_lr')
     if options.get('use_2c', None) is not None:
         model.add_constraint(use_2c[options['use_2c']] == 1, name='force_2c')
     if options.get('use_ptb', None) is not None:
         model.add_constraint(use_ptb[options['use_ptb']] == 1, name='force_ptb')
+    if len(allowed_chip_gws.get('wc', [])) > 0:
+        gws_banned = [w for w in gameweeks if w not in allowed_chip_gws['wc']]
+        model.add_constraints((use_wc[w] == 0 for w in gws_banned), name='banned_wc_gws')
+    if len(allowed_chip_gws.get('fh', [])) > 0:
+        gws_banned = [w for w in gameweeks if w not in allowed_chip_gws['fh']]
+        model.add_constraints((use_fh[w] == 0 for w in gws_banned), name='banned_fh_gws')
+    if len(allowed_chip_gws.get('bb', [])) > 0:
+        gws_banned = [w for w in gameweeks if w not in allowed_chip_gws['bb']]
+        model.add_constraints((use_bb[w] == 0 for w in gws_banned), name='banned_bb_gws')
+
     ## Multiple-sell fix
     model.add_constraints((transfer_out_first[p,w] + transfer_out_regular[p,w] <= 1 for p in price_modified_players for w in gameweeks), name='multi_sell_1')
     model.add_constraints((
-        (wbar - next_gw + 1) * so.expr_sum(transfer_out_first[p,w] for w in gameweeks if w >= wbar) >=
+        horizon * so.expr_sum(transfer_out_first[p,w] for w in gameweeks if w <= wbar) >=
         so.expr_sum(transfer_out_regular[p,w] for w in gameweeks if w >= wbar)
         for p in price_modified_players for wbar in gameweeks
     ), name='multi_sell_2')
@@ -363,12 +426,24 @@ def solve_multi_period_fpl(data, options):
     if options.get("no_future_transfer"):
         model.add_constraint(so.expr_sum(transfer_in[p,w] for p in players for w in gameweeks if w > next_gw and w != options.get('use_wc')) == 0, name='no_future_transfer')
 
+    if options.get("no_transfer_last_gws"):
+        no_tr_gws = options['no_transfer_last_gws']
+        if horizon > no_tr_gws:
+            model.add_constraints((so.expr_sum(transfer_in[p,w] for p in players) <= 15 * use_wc[w] for w in gameweeks if w > last_gw - no_tr_gws), name='tr_ban_gws')
+
     if options.get("num_transfers", None) is not None:
         model.add_constraint(so.expr_sum(transfer_in[p,next_gw] for p in players) == options['num_transfers'], name='tr_limit')
 
     if options.get("hit_limit", None) is not None:
         model.add_constraint(so.expr_sum(penalized_transfers[w] for w in gameweeks) <= options['hit_limit'], name='horizon_hit_limit')
 
+    if options.get("future_transfer_limit", None) is not None:
+        model.add_constraint(so.expr_sum(transfer_in[p,w] for p in players for w in gameweeks if w > next_gw and w != options.get('use_wc')) <= options['future_transfer_limit'], name='future_tr_limit')
+
+    if options.get("no_transfer_gws", None) is not None:
+        if len(options['no_transfer_gws']) > 0:
+            model.add_constraint(so.expr_sum(transfer_in[p,w] for p in players for w in options['no_transfer_gws']) == 0, name='banned_gws_for_tr')
+    
     for booked_transfer in booked_transfers:
         transfer_gw = booked_transfer.get('gw', None)
 
@@ -385,6 +460,35 @@ def solve_multi_period_fpl(data, options):
             model.add_constraint(transfer_out[player_out, transfer_gw] == 1,
                                  name=f'booked_transfer_out_{transfer_gw}_{player_out}')
 
+    if options.get('no_opposing_play') is True:
+        for gw in gameweeks:
+            gw_games = [i for i in fixtures if i['gw'] == gw]
+            opposing_players = [(p1,p2) for f in gw_games for p1 in players if merged_data.loc[p1, 'name'] == f['home'] for p2 in players if merged_data.loc[p2, 'name'] == f['away']]
+            model.add_constraints((lineup[p1,gw] + lineup[p2,gw] <= 1 for (p1,p2) in opposing_players), name=f'no_opp_{gw}')
+
+    if options.get("pick_prices") is not None:
+        buffer = 0.2
+        price_choices = options["pick_prices"]
+        for (pos,val) in price_choices.items():
+            if val == '':
+                continue
+            price_points = [float(i) for i in val.split(',')]
+            value_dict = {i: price_points.count(i) for i in set(price_points)}
+            con_iter = 0
+            for key, count in value_dict.items():
+                target_players = [p for p in players if merged_data.loc[p, 'Pos'] == pos and buy_price[p] >= key - buffer and buy_price[p] <= key + buffer]
+                model.add_constraints((so.expr_sum(squad[p,w] for p in target_players) >= count for w in gameweeks), name=f'price_point_{pos}_{con_iter}')
+                con_iter += 1
+                
+    if options.get("no_gk_rotation_after") is not None:
+        target_gw = int(options['no_gk_rotation_after'])
+        players_gk = [p for p in players if player_type[p] == 1]
+        model.add_constraints((lineup[p,w] >= lineup[p,target_gw] - use_fh[w] for p in players_gk for w in gameweeks if w > target_gw), name='fixed_lineup_gk')
+
+    if len(options.get("no_chip_gws", [])) > 0:
+        no_chip_gws = options['no_chip_gws']
+        model.add_constraint(so.expr_sum(use_bb[w] + use_wc[w] + use_fh[w] for w in no_chip_gws) == 0, name='no_chip_gws')
+
     # Objectives
     gw_xp = {w: so.expr_sum(points_player_week[p,w] * (lineup[p,w] + captain[p,w] + 0.1*vicecap[p,w] + ptb_ind[p,w] + so.expr_sum(bench_weights[o] * bench[p,w,o] for o in order)) for p in players) for w in gameweeks}    
     gw_total = {w: gw_xp[w] - 4 * penalized_transfers[w] + ft_value * free_transfers[w] + itb_value * in_the_bank[w] for w in gameweeks}
@@ -395,104 +499,238 @@ def solve_multi_period_fpl(data, options):
         decay_objective = so.expr_sum(gw_total[w] * pow(decay_base, w-next_gw) for w in gameweeks)
         model.set_objective(-decay_objective, sense='N', name='total_decay_xp')
 
-    # Solve
-    tmp_folder = Path() / "tmp"
-    tmp_folder.mkdir(exist_ok=True, parents=True)
-    model.export_mps(f'tmp/{problem_name}_{problem_id}.mps')
-    print(f"Exported problem with name: {problem_name}_{problem_id}")
+    iteration = options.get("iteration", 1)
+    iteration_criteria = options.get("iteration_criteria", "this_gw_transfer_in")
+    solutions = []
 
-    t0 = time.time()
-    time.sleep(0.5)
+    for iter in range(iteration):
 
-    use_cmd = options.get('use_cmd', False)
+        # Solve
+        tmp_folder = Path() / "tmp"
+        tmp_folder.mkdir(exist_ok=True, parents=True)
+        model.export_mps(f'tmp/{problem_name}_{problem_id}_{iter}.mps')
+        print(f"Exported problem with name: {problem_name}_{problem_id}_{iter}")
 
-    command = f'cbc tmp/{problem_name}_{problem_id}.mps cost column ratio 1 solve solu tmp/{problem_name}_{problem_id}_sol_init.txt'
-    if use_cmd:
-        os.system(command)
-    else:
-        process = Popen(command, shell=False)
-        process.wait()
-    secs = options.get('secs', 20*60)
-    command = f'cbc tmp/{problem_name}_{problem_id}.mps mips tmp/{problem_name}_{problem_id}_sol_init.txt cost column sec {secs} solve solu tmp/{problem_name}_{problem_id}_sol.txt'
-    if use_cmd:
-        os.system(command)
-    else:
-        process = Popen(command, shell=False) # add 'stdout=DEVNULL' for disabling logs
-        process.wait()
+        t0 = time.time()
+        time.sleep(0.5)
 
-    t1 = time.time()
-    print(t1-t0, "seconds passed")
+        if options.get('export_debug', False) is True:
+            with open("debug.sas", "w") as file:
+                file.write(model.to_optmodel())
 
-    # Parsing
-    with open(f'tmp/{problem_name}_{problem_id}_sol.txt', 'r') as f:
-        for line in f:
-            if 'objective value' in line:
-                continue
-            words = line.split()
-            var = model.get_variable(words[1])
-            var.set_value(float(words[2]))
+        use_cmd = options.get('use_cmd', False)
 
-    # DataFrame generation
-    picks = []
-    for w in gameweeks:
-        for p in players:
-            if squad[p,w].get_value() + squad_fh[p,w].get_value() + squad_lr[p,w].get_value() + transfer_out[p,w].get_value() > 0.5:
-                lp = merged_data.loc[p]
-                is_captain = 1 if captain[p,w].get_value() > 0.5 else 0
-                is_squad = 1 if (use_fh[w].get_value() < 0.5 and squad[p,w].get_value() > 0.5) or (use_fh[w].get_value() > 0.5 and squad_fh[p,w].get_value() > 0.5) or (use_lr[w].get_value() > 0.5 and squad_lr[p,w].get_value() > 0.5) else 0
-                is_lineup = 1 if lineup[p,w].get_value() > 0.5 else 0
-                is_vice = 1 if vicecap[p,w].get_value() > 0.5 else 0
-                is_transfer_in = 1 if transfer_in[p,w].get_value() > 0.5 else 0
-                is_transfer_out = 1 if transfer_out[p,w].get_value() > 0.5 else 0
-                bench_value = -1
-                for o in order:
-                    if bench[p,w,o].get_value() > 0.5:
-                        bench_value = o
-                position = type_data.loc[lp['element_type'], 'singular_name_short']
-                player_buy_price = 0 if not is_transfer_in else buy_price[p]
-                player_sell_price = 0 if not is_transfer_out else (sell_price[p] if p in price_modified_players and transfer_out_first[p,w].get_value() > 0.5 else buy_price[p])
-                multiplier = 1*(is_lineup==1) + 1*(is_captain==1) + (1 * (is_lineup==1 and position == 'FÖR') * use_ptb[w]).get_value()
-                xp_cont = points_player_week[p,w] * multiplier
-                
-                picks.append([
-                    w, lp['web_name'], position, lp['element_type'], lp['name'], player_buy_price, player_sell_price, round(points_player_week[p,w],2), minutes_player_week[p,w], is_squad, is_lineup, bench_value, is_captain, is_vice, is_transfer_in, is_transfer_out, multiplier, xp_cont, ptb_ind[p,w].get_value()
-                ])
+        solver = options.get('solver', 'cbc')
 
-    picks_df = pd.DataFrame(picks, columns=['week', 'name', 'pos', 'type', 'team', 'buy_price', 'sell_price', 'xP', 'xMin', 'squad', 'lineup', 'bench', 'captain', 'vicecaptain', 'transfer_in', 'transfer_out', 'multiplier', 'xp_cont', 'ptb_ind']).sort_values(by=['week', 'lineup', 'type', 'xP'], ascending=[True, False, True, True])
-    total_xp = so.expr_sum((lineup[p,w] + captain[p,w]) * points_player_week[p,w] for p in players for w in gameweeks).get_value()
+        if solver == 'cbc':
 
-    picks_df.sort_values(by=['week', 'squad', 'lineup', 'bench', 'type'], ascending=[True, False, False, True, True], inplace=True)
+            if options.get('single_solve') is True:
 
-    # Writing summary
-    summary_of_actions = ""
-    for w in gameweeks:
-        summary_of_actions += f"** GW {w}:\n"
-        summary_of_actions += ("CHIP WC" if use_wc[w].get_value() > 0.5 else "") + ("CHIP FH" if use_fh[w].get_value() > 0.5 else "") + ("CHIP BB" if use_bb[w].get_value() > 0.5 else "") + ("CHIP LR" if use_lr[w].get_value() > 0.5 else "") + ("CHIP 2C" if use_2c[w].get_value() > 0.5 else "") + ("CHIP PTB" if use_ptb[w].get_value() > 0.5 else "") + "\n"
-        summary_of_actions += f"ITB={in_the_bank[w].get_value()}, FT={free_transfers[w].get_value()}, PT={penalized_transfers[w].get_value()}, NT={number_of_transfers[w].get_value()}\n"
-        for p in players:
-            if transfer_in[p,w].get_value() > 0.5:
-                summary_of_actions += f"Buy {p} - {merged_data['web_name'][p]}\n"
-        for p in players:
-            if transfer_out[p,w].get_value() > 0.5:
-                summary_of_actions += f"Sell {p} - {merged_data['web_name'][p]}\n"
+                gap = options.get('gap', 0)
+                secs = options.get('secs', 20*60)
 
-        lineup_players = picks_df[(picks_df['week'] == w) & (picks_df['lineup'] == 1)]
-        bench_players = picks_df[(picks_df['week'] == w) & (picks_df['bench'] >= 0)]
+                command = f'cbc tmp/{problem_name}_{problem_id}_{iter}.mps cost column ratio {gap} sec {secs} solve solu tmp/{problem_name}_{problem_id}_{iter}_sol.txt'
+                if use_cmd:
+                    os.system(command)
+                else:
+                    process = Popen(command, shell=False)
+                    process.wait()
 
-        summary_of_actions += "---\nLineup: " + ', '.join(lineup_players['name'].tolist()) + "\n"
-        summary_of_actions += "Bench: " + ', '.join(bench_players['name'].tolist()) + "\n"
-        summary_of_actions += "Captain: " + ', '.join(lineup_players[lineup_players["captain"]==1]["name"].tolist()) + "\n"
-        summary_of_actions += "Lineup xPts: " + str(round(lineup_players['xp_cont'].sum(),2)) + "\n---\n\n"
+            else:
+
+                command = f'cbc tmp/{problem_name}_{problem_id}_{iter}.mps cost column ratio 1 solve solu tmp/{problem_name}_{problem_id}_{iter}_sol_init.txt'
+                if use_cmd:
+                    os.system(command)
+                else:
+                    process = Popen(command, shell=False)
+                    process.wait()
+                secs = options.get('secs', 20*60)
+                command = f'cbc tmp/{problem_name}_{problem_id}_{iter}.mps mips tmp/{problem_name}_{problem_id}_{iter}_sol_init.txt cost column sec {secs} solve solu tmp/{problem_name}_{problem_id}_{iter}_sol.txt'
+                if use_cmd:
+                    os.system(command)
+                else:
+                    process = Popen(command, shell=False) # add 'stdout=DEVNULL' for disabling logs
+                    process.wait()
+
+            # Popen fix with split?
+
+            t1 = time.time()
+            print(t1-t0, "seconds passed")
+
+            # Parsing
+            with open(f'tmp/{problem_name}_{problem_id}_{iter}_sol.txt', 'r') as f:
+                for v in model.get_variables():
+                    v.set_value(0)
+                for line in f:
+                    words = line.split()
+                    if words[0] == 'Infeasible':
+                        raise ValueError("Infeasible problem instance, check your parameters")
+                    if 'objective value' in line:
+                        continue
+                    var = model.get_variable(words[1])
+                    var.set_value(float(words[2]))
+
+        elif solver == 'highs':
+
+            highs_exec = options.get('solver_path', 'highs')
+
+            secs = options.get('secs', 20*60)
+            presolve = options.get('presolve', 'off')
+
+            command = f'{highs_exec} --presolve {presolve} --model_file tmp/{problem_name}_{problem_id}_{iter}.mps --time_limit {secs} --solution_file tmp/{problem_name}_{problem_id}_{iter}_sol.txt'
+            if use_cmd:
+                os.system(command)
+            else:
+                process = Popen(command, shell=False)
+                process.wait()
+
+            # Parsing
+            with open(f'tmp/{problem_name}_{problem_id}_{iter}_sol.txt', 'r') as f:
+                for v in model.get_variables():
+                    v.set_value(0)
+                cols_started = False
+                for line in f:
+                    if not cols_started and "# Columns" not in line:
+                        continue
+                    elif "# Columns" in line:
+                        cols_started = True
+                        continue
+                    elif cols_started and line[0] != "#":
+                        words = line.split()
+                        v = model.get_variable(words[0])
+                        try:
+                            if v.get_type() == so.INT:
+                                v.set_value(round(float(words[1])))
+                            elif v.get_type() == so.BIN:
+                                v.set_value(round(float(words[1])))
+                            elif v.get_type() == so.CONT:
+                                v.set_value(round(float(words[1]),3))
+                        except:
+                            print("Error", words[0], line)
+                    elif line[0] == "#":
+                        break
+
+        # DataFrame generation
+        picks = []
+        for w in gameweeks:
+            for p in players:
+                if squad[p,w].get_value() + squad_fh[p,w].get_value() + transfer_out[p,w].get_value() > 0.5:
+                    lp = merged_data.loc[p]
+                    is_captain = 1 if captain[p,w].get_value() > 0.5 else 0
+                    is_squad = 1 if (use_fh[w].get_value() < 0.5 and squad[p,w].get_value() > 0.5) or (use_fh[w].get_value() > 0.5 and squad_fh[p,w].get_value() > 0.5) else 0
+                    is_lineup = 1 if lineup[p,w].get_value() > 0.5 else 0
+                    is_vice = 1 if vicecap[p,w].get_value() > 0.5 else 0
+                    is_transfer_in = 1 if transfer_in[p,w].get_value() > 0.5 else 0
+                    is_transfer_out = 1 if transfer_out[p,w].get_value() > 0.5 else 0
+                    bench_value = -1
+                    for o in order:
+                        if bench[p,w,o].get_value() > 0.5:
+                            bench_value = o
+                    position = type_data.loc[lp['element_type'], 'singular_name_short']
+                    player_buy_price = 0 if not is_transfer_in else buy_price[p]
+                    player_sell_price = 0 if not is_transfer_out else (sell_price[p] if p in price_modified_players and transfer_out_first[p,w].get_value() > 0.5 else buy_price[p])
+                    multiplier = 1*(is_lineup==1) + 1*(is_captain==1)
+                    xp_cont = points_player_week[p,w] * multiplier
+
+                    # chip
+                    if use_wc[w].get_value() > 0.5:
+                        chip_text = 'WC'
+                    elif use_fh[w].get_value() > 0.5:
+                        chip_text = 'FH'
+                    elif use_bb[w].get_value() > 0.5:
+                        chip_text = 'BB'
+                    # elif use_tc
+                    else:
+                        chip_text = ''
+                    
+                    picks.append([
+                        p, w, lp['web_name'], position, lp['element_type'], lp['name'], player_buy_price, player_sell_price, round(points_player_week[p,w],2), minutes_player_week[p,w], is_squad, is_lineup, bench_value, is_captain, is_vice, is_transfer_in, is_transfer_out, multiplier, xp_cont, chip_text
+                    ])
+
+        picks_df = pd.DataFrame(picks, columns=['id', 'week', 'name', 'pos', 'type', 'team', 'buy_price', 'sell_price', 'xP', 'xMin', 'squad', 'lineup', 'bench', 'captain', 'vicecaptain', 'transfer_in', 'transfer_out', 'multiplier', 'xp_cont', 'chip']).sort_values(by=['week', 'lineup', 'type', 'xP'], ascending=[True, False, True, True])
+        total_xp = so.expr_sum((lineup[p,w] + captain[p,w]) * points_player_week[p,w] for p in players for w in gameweeks).get_value()
+
+        picks_df.sort_values(by=['week', 'squad', 'lineup', 'bench', 'type'], ascending=[True, False, False, True, True], inplace=True)
+
+        # Writing summary
+        summary_of_actions = ""
+        move_summary = {'buy': [], 'sell': []}
+        cumulative_xpts = 0
+        for w in gameweeks:
+            summary_of_actions += f"** GW {w}:\n"
+            chip_decision = ("WC" if use_wc[w].get_value() > 0.5 else "") + ("FH" if use_fh[w].get_value() > 0.5 else "") + ("BB" if use_bb[w].get_value() > 0.5 else "")
+            if chip_decision != "":
+                summary_of_actions += "CHIP " + chip_decision + "\n"
+            summary_of_actions += f"ITB={in_the_bank[w].get_value()}, FT={free_transfers[w].get_value()}, PT={penalized_transfers[w].get_value()}, NT={number_of_transfers[w].get_value()}\n"
+            for p in players:
+                if transfer_in[p,w].get_value() > 0.5:
+                    summary_of_actions += f"Buy {p} - {merged_data['web_name'][p]}\n"
+                    if w == next_gw:
+                        move_summary['buy'].append(merged_data['web_name'][p])
+            for p in players:
+                if transfer_out[p,w].get_value() > 0.5:
+                    summary_of_actions += f"Sell {p} - {merged_data['web_name'][p]}\n"
+                    if w == next_gw:
+                        move_summary['sell'].append(merged_data['web_name'][p])
+
+            lineup_players = picks_df[(picks_df['week'] == w) & (picks_df['lineup'] == 1)]
+            bench_players = picks_df[(picks_df['week'] == w) & (picks_df['bench'] >= 0)]
+
+            # captain_name = picks_df[(picks_df['week'] == w) & (picks_df['captain'] == 1)].iloc[0]['name']
+            # vicecap_name = picks_df[(picks_df['week'] == w) & (picks_df['vicecaptain'] == 1)].iloc[0]['name']
+
+            summary_of_actions += "---\nLineup: \n"
+
+            def get_display(row):
+                return f"{row['name']} ({row['xP']}{', C' if row['captain'] == 1 else ''}{', V' if row['vicecaptain'] == 1 else ''})"
+
+            for type in [1,2,3,4]:
+                type_players = lineup_players[lineup_players['type'] == type]
+                entries = type_players.apply(get_display, axis=1)
+                summary_of_actions += '\t' + ', '.join(entries.tolist()) + "\n"
+            summary_of_actions += "Bench: \n\t" + ', '.join(bench_players['name'].tolist()) + "\n"
+            summary_of_actions += "Lineup xPts: " + str(round(lineup_players['xp_cont'].sum(),2)) + "\n---\n\n"
+            cumulative_xpts = cumulative_xpts + round(lineup_players['xp_cont'].sum(),2)
+        print("Cumulative xPts: " + str(round(cumulative_xpts,2)) + "\n---\n\n")
+
+        if options.get('delete_tmp'):
+            os.unlink(f"tmp/{problem_name}_{problem_id}_{iter}.mps")
+            os.unlink(f"tmp/{problem_name}_{problem_id}_{iter}_sol.txt")
 
 
-    if options.get('delete_tmp'):
-        os.unlink(f"tmp/{problem_name}_{problem_id}.mps")
-        os.unlink(f"tmp/{problem_name}_{problem_id}_sol.txt")
+        buy_decisions = ', '.join(move_summary['buy'])
+        sell_decisions = ', '.join(move_summary['sell'])
+        if buy_decisions == '':
+            buy_decisions = '-'
+        if sell_decisions == '':
+            sell_decisions = '-'
 
-    return {'model': model, 'picks': picks_df, 'total_xp': total_xp, 'summary': summary_of_actions}
+        if iteration == 1:
+            return [{'iter': iter, 'model': model, 'picks': picks_df, 'total_xp': total_xp, 'summary': summary_of_actions, 'buy': buy_decisions, 'sell': sell_decisions, 'score': -model.get_objective_value()}]
 
+        # Add current solution to a list, and add a new cut
+        solutions.append({'iter': iter, 'model': model, 'picks': picks_df, 'total_xp': total_xp, 'summary': summary_of_actions, 'buy': buy_decisions, 'sell': sell_decisions, 'score': -model.get_objective_value()})
+        if iteration_criteria == 'this_gw_transfer_in':
+            actions = so.expr_sum(1-transfer_in[p, next_gw] for p in players if transfer_in[p, next_gw].get_value() > 0.5) \
+                    + so.expr_sum(transfer_in[p, next_gw] for p in players if transfer_in[p, next_gw].get_value() < 0.5)
+        elif iteration_criteria == 'this_gw_transfer_out':
+            actions = so.expr_sum(1-transfer_out[p, next_gw] for p in players if transfer_out[p, next_gw].get_value() > 0.5) \
+                    + so.expr_sum(transfer_out[p, next_gw] for p in players if transfer_out[p, next_gw].get_value() < 0.5)
+        elif iteration_criteria == 'this_gw_transfer_in_out':
+            actions = so.expr_sum(1-transfer_in[p, next_gw] for p in players if transfer_in[p, next_gw].get_value() > 0.5) \
+                    + so.expr_sum(transfer_in[p, next_gw] for p in players if transfer_in[p, next_gw].get_value() < 0.5) \
+                    + so.expr_sum(1-transfer_out[p, next_gw] for p in players if transfer_out[p, next_gw].get_value() > 0.5) \
+                    + so.expr_sum(transfer_out[p, next_gw] for p in players if transfer_out[p, next_gw].get_value() < 0.5)
+        elif iteration_criteria == 'chip_gws':
+            actions = so.expr_sum(1-use_wc[w] for w in gameweeks if use_wc[w].get_value() > 0.5) \
+                    + so.expr_sum(use_wc[w] for w in gameweeks if use_wc[w].get_value() < 0.5) \
+                    + so.expr_sum(1-use_bb[w] for w in gameweeks if use_bb[w].get_value() > 0.5) \
+                    + so.expr_sum(use_bb[w] for w in gameweeks if use_bb[w].get_value() < 0.5) \
+                    + so.expr_sum(1-use_fh[w] for w in gameweeks if use_fh[w].get_value() > 0.5) \
+                    + so.expr_sum(use_fh[w] for w in gameweeks if use_fh[w].get_value() < 0.5)
+        model.add_constraint(actions >= 1, name=f'cutoff_{iter}')
 
-
+    return solutions
 
 if __name__ == '__main__':
 
