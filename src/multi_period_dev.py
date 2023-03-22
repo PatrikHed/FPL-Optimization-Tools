@@ -87,7 +87,7 @@ def prep_data(my_data, options):
     data_weights = options.get('data_weights', {'review': 100})
 
     data = read_data(options, datasource, data_weights)
-    
+    print(data.head())
     data = data.fillna(0)
     if 'ID' in data:
         data['review_id'] = data['ID']
@@ -99,7 +99,7 @@ def prep_data(my_data, options):
 
     merged_data = pd.merge(elements_team, data, left_on='id_x', right_on='review_id')
     merged_data.set_index(['id_x'], inplace=True)
-
+    print(merged_data.head())
     # Check if data exists
     for week in range(gw, min(39, gw+horizon)):
         if f'{week}_Pts' not in data.keys():

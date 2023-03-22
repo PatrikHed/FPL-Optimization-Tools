@@ -10,6 +10,11 @@ def read_data(options, source, weights=None):
         data = pd.read_csv(options.get('data_path', '../data/fplreview.csv'))
         data['review_id'] = data['ID']
         return data
+    elif source == 'allfalytics':
+        data = pd.read_csv(options.get('data_path', '../data/allsvenskan_xpts.csv'))
+        data['review_id'] = data['ID']
+        return data
+    
     elif source == 'review-odds':
         data = pd.read_csv(options.get('data_path', '../data/fplreview-odds.csv'))
         data['review_id'] = data['ID']
