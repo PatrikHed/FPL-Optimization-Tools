@@ -41,7 +41,7 @@ Reach out to me if you need the raw data to give it a try.
 
 ## Instructions
 
-### Steps
+### Installation Steps
 
 You will need to follow steps below to install required platform and also optimization solver (CBC).
 
@@ -49,21 +49,14 @@ You will need to follow steps below to install required platform and also optimi
 - Download and install Python and Git to your machine
 - Download CBC optimization solver binary and add it to your environment path (example: https://youtu.be/DFXCXoR6Dvw?t=1642)
 - Clone the repository
-  
+
   `git clone https://github.com/sertalpbilal/FPL-Optimization-Tools.git fpl-optimization`
 
 - Install required packages
-  
+
   ``` shell
   cd fpl-optimization
   python -m pip install -r requirements.txt
-  ```
-
-- Navigate to `data` directory and copy login file without `sample` extension
-  
-  ``` shell
-  cd data
-  cp login.json.sample login.json
   ```
 
 - Download FPLReview projections and save it under `data` and rename it to `fplreview.csv`
@@ -80,17 +73,24 @@ You will need to follow steps below to install required platform and also optimi
   Note that logging in for Allsvenskan Fantasy does not yet work correctly, so you will have to manually get your team info and save it in a `team.json` file
 
 - Navigate to `run` directory
-  
+
   `cd ..\run`
 
-  And run either `solve_regular.py` (for regular GW solve) or `solve_wildcard.py` (for wildcard optimization)  
+  And run either `solve_regular.py` (for regular GW solve) or `solve_wildcard.py` (for wildcard optimization)
   See instructions below.
 
-### Multi-period (regular) GW optimization
+- Log in FPL from your browser and open
+  https://fantasy.premierleague.com/api/my-team/MY_TEAM_ID/
+  after replacing `MY_TEAM_ID` with your team id.
+  Copy the content of the page into `data\team.json` file, by creating one.
+
+  A sample team.json file is provided for your reference: `team.json.sample`
+
+### Multi-period GW optimization
 
 
-- Edit content of `regular_settings.json` file
-  
+- Edit content of `data/regular_settings.json` file
+
   ``` json
     {
         "api_base": "https://fantasy.allsvenskan.se",
@@ -101,8 +101,13 @@ You will need to follow steps below to install required platform and also optimi
         "horizon": 5,
         "ft_value": 1.5,
         "itb_value": 0.2,
-        "no_future_transfer": false,
+        "decay_base": 0.84,
+        "no_future_transfer": true,
+        "no_transfer_last_gws": 0,
         "randomized": false,
+        "xmin_lb": 2,
+        "ev_per_price_cutoff": 20,
+        "bench_weights": {"0": 0.03, "1": 0.21, "2": 0.06, "3": 0.003},
         "banned": [],
         "locked": [],
         "delete_tmp": true,
@@ -115,7 +120,23 @@ You will need to follow steps below to install required platform and also optimi
         "use_2c": null,
         "use_ptb": null,
         "chip_limits": {"bb": 0, "wc": 0, "fh": 0, "tc": 0, "lr":0, "2c":0, "ptb":0},
-        "booked_transfers": []
+        "future_transfer_limit": null,
+        "no_transfer_gws": [],
+        "booked_transfers": [],
+        "no_chip_gws": [],
+        "allowed_chip_gws": {"bb": [], "wc": [], "fh": [], "tc": []},
+        "num_transfers": null,
+        "hit_limit": null,
+        "preseason": false,
+        "cbc_path": "",
+        "no_opposing_play": false,
+        "pick_prices": {"G": "", "D": "", "M": "", "F": ""},
+        "no_gk_rotation_after": null,
+        "iteration": 1,
+        "iteration_criteria": "this_gw_transfer_in",
+        "datasource" : "review",
+        "data_weights": {"review": 50, "review-odds": 25, "mikkel": 15, "kiwi": 10},
+        "export_data": "final.csv"
     }
   ```
   - `api_base`: base url of the API. defaults to `https://fantasy.premierleague.com`
@@ -126,8 +147,13 @@ You will need to follow steps below to install required platform and also optimi
   - `horizon`: length of planning horizon
   - `ft_value`: value assigned to the extra free transfer
   - `itb_value`: value assigned to having 1.0 extra budget
+  - `decay_base`: value assigned to decay rate of expected points
   - `no_future_transfer`: `true` or `false` whether you want to plan future transfers or not
+  - `no_transfer_last_gws`: the number of gws at the end of the period you want to ban transfers
   - `randomized`: `true` or `false` whether you would like to add random noise to EV
+  - `xmin_lb`: cut-off for dropping players below this many minutes expectation
+  - `ev_per_price_cutoff`: cut-off percentile for dropping players based on total EV per price (e.g. `20` means drop players below 20% percentile)
+  - `bench_weights`: percentage weights in objective for bench players (gk and 3 outfield)
   - `banned`: list of banned player IDs
   - `locked`: list of player IDs to always have during the horizon (e.g. `233` for Salah)
   - `delete_tmp`: `true` or `false` whether to delete generated temporary files after solve
@@ -142,58 +168,72 @@ You will need to follow steps below to install required platform and also optimi
   - `use_ptb`: specify a gameweek where the solver has to use Park The Bus (requires chip_limit for ptb > 0)
   - `chip_limits`: sets the maximum limit for chip usage. (if you're optimizing from GW1 you will need to add +1 to wc)
   - `booked_transfers`: list of booked transfers for future gameweeks. needs to have a `gw` key and at least one of `transfer_in` or `transfer_out` with the player ID  (e.g. `233` for Salah)
+  - `future_transfer_limit`: upper bound how many transfers are allowed in future GWs
+  - `no_transfer_gws`: list of GW numbers where transfers are not allowed
+  - `booked_transfers`: list of booked transfers for future gameweeks, needs to have a `gw` key and at least one of `transfer_in` or `transfer_out` with the player ID. For example, to book a transfer of buying Kane (427) on GW5 and selling him on GW7, use
+
+    `"booked_transfers": [{"gw": 5, "transfer_in": 427}, {"gw": 7, "transfer_out": 427}]`
+  - `chip_limits`: how many chips of each kind can be used by solver (you need to set it to at least 1 when force using a chip)
+  - `no_chip_gws`: list of GWs to ban solver from using a chip
+  - `allowed_chip_gws`: dictionary of list of GWs to allow chips to be used. For example  
+    `"allowed_chip_gws": {"wc": [27,31]}`  
+    will allow solver to use WC in GW27 and GW31, but not in another GW
+  - `num_transfers`: fixed number of transfers for this GW
+  - `hit_limit`: limit on total hits can be taken by the solver for entire horizon
+  - `preseason`: solve flag for GW1 where team data is not important
+  - `cbc_path`: binary location of the cbc solver (`bin` folder)
+  - `no_opposing_play`: `true` if you do not want to have players in your lineup playing against each other in a GW
+  - `pick_prices`: price points of players you want to force in a comma separated string
+    For example, to force two 11.5M forwards, and one 8M midfielder, use
+    `"pick_prices": {"G": "", "D": "", "M": "8", "F": "11.5,11.5"}`
+  - `no_gk_rotation_after`: use same lineup GK after given GW, e.g. setting this value to `26` means all GWs after 26 will use same lineup GK
+  - `iteration`: number of different solutions to be generated, the criteria is controlled by `iteration_criteria`
+  - `iteration_criteria`: rule on separating what a different solution mean, such as `this_gw_transfer_in` will force to replace player to buy current GW in each solution, while `this_gw_transfer_in_out` can find an alternative move with either bought or sold players to be different.
+  - `datasource` : `review`, `kiwi`, `mikkel` or `avg` specifies the data to be used.
+
+    - `review` requires `fplreview.csv` file
+    - `review-odds` requires `fplreview-odds.csv` file
+    - `kiwi` requires `kiwi.csv` file
+    - `mikkel` requires `TransferAlgorithm.csv`, file
+    - `mixed` requires an additional parameter `data_weights`, and any corresponding files mentioned above
+  
+    under `data` folder to be present
+  - `data_weights`: weight percentage for each data source, given as a dictionary, where keys should be one of valid data sources
+  - `export_data`: option for exporting final data as a CSV file (when using `mixed` data)
 
 - Run the multi-period optimization
-  
+
   ``` shell
   python solve_regular.py
   ```
 
-- Find the optimal plans under `run\results` directory with timestamp
-  
+- Find the optimal plans under `data\results` directory with timestamp
+
   ```
-    > cd results
+    > cd ../data/results
     > ls
     regular_2021-11-04_10-00-00.csv
   ```
 
+## Run in Docker
 
+A Dockerised version of the solver is included in this repo which
+includes all dependencies required to run the program and save
+results.  Docker must be installed on the host machine.
 
-### Wildcard optimization
+In order to run the solver via Docker, you'll firstly need to follow the instructions in the `Installation Steps` section to add the following files to the `/data` folder:
 
+ - `team.json`
+ - `regular_settings.json`
+ - `fplreview.csv`
 
-- Edit content of `wildcard_settings.json` file
-  
-  ``` json
-    { 
-        "horizon": 4,
-        "use_wc": 8,
-        "no_future_transfer": true,
-        "randomized": false,
-        "wc_limit": 1,
-        "banned": [],
-        "locked": [],
-        "delete_tmp": true,
-        "secs": 120
-    }
-  ```
+Then, to pull the Docker image, build it, and then run the solver, simply run the following command:
 
-  - `use_wc`: GW number you want to use your wildcard (use `null` if you want optimization to choose it for you)
-  - `wc_limit`: 1 or 0, depending on you want to use WC chip or not
+```shell
+> docker-compose up
+```
 
-- Run the wildcard optimization
-  
-  ``` shell
-  python solve_wildcard.py
-  ```
-
-- Find the optimal plans under `run\results` directory with timestamp
-  
-  ```
-    > cd results
-    > ls
-    wildcard_2021-10-04_10-49-07.csv  wildcard_2021-10-04_10-54-50.csv
-  ```
+After the initial setup, re-running this command will skip the pull and build steps and simply run the solver.
 
 # License
 

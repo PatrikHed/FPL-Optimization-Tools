@@ -3,12 +3,15 @@
 *.sol
 *.cmd
 *.code-workspace
+**/__pycache__/
 output/*
 archive/*
 solver/*
 */.ipynb_checkpoints/*
 data/fplreview.csv
 data/allsvenskan_xpts.csv
+data/kiwi.csv
+data/TransferAlgorithm.csv
 data/login.json
 data/allsvenskanlogin.json
 data/team.json
