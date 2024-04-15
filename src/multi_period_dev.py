@@ -122,7 +122,7 @@ def prep_data(my_data, options):
     safe_players = initial_squad + options.get('locked', []) + options.get('banned', []) + options.get('keep', [])
     if ev_per_price_cutoff != 0:
         cutoff = (merged_data['total_ev'] / merged_data['now_cost']).quantile(ev_per_price_cutoff/100)
-        merged_data = merged_data[(merged_data['total_ev'] / merged_data['now_cost'] > cutoff) | (merged_data['review_id'].isin(safe_players))].copy()
+        merged_data = merged_data[(merged_data['total_ev'] / merged_data['now_cost'] >= cutoff) | (merged_data['review_id'].isin(safe_players))].copy()
 
     print(len(merged_data), "total players (after)")
 
@@ -317,8 +317,8 @@ def solve_multi_period_fpl(data, options):
     model.add_constraints((so.expr_sum(lineup[p,w] for p in players) == 11 + 4 * use_bb[w] for w in gameweeks), name='lineup_count')
     model.add_constraints((so.expr_sum(bench[p,w,0] for p in players if player_type[p] == 1) == 1 - use_bb[w] for w in gameweeks), name='bench_gk')
     model.add_constraints((so.expr_sum(bench[p,w,o] for p in players) == 1 - use_bb[w] for w in gameweeks for o in [1,2,3]), name='bench_count')
-    model.add_constraints((so.expr_sum(captain[p,w] for p in players) == 1 + use_2c[w] - use_lr[w] - use_ptb[w] for w in gameweeks), name='captain_count')
-    model.add_constraints((so.expr_sum(vicecap[p,w] for p in players) == 1 - use_2c[w] - use_lr[w] - use_ptb[w] for w in gameweeks), name='vicecap_count')
+    model.add_constraints((so.expr_sum(captain[p,w] for p in players) == 1 + use_2c[w] - use_ptb[w] for w in gameweeks), name='captain_count')
+    model.add_constraints((so.expr_sum(vicecap[p,w] for p in players) == 1 - use_2c[w] - use_ptb[w] for w in gameweeks), name='vicecap_count')
     model.add_constraints((lineup[p,w] <= squad[p,w] + use_fh[w] + use_lr[w] for p in players for w in gameweeks), name='lineup_squad_rel')
     model.add_constraints((bench[p,w,o] <= squad[p,w] + use_fh[w] + use_lr[w] for p in players for w in gameweeks for o in order), name='bench_squad_rel')
     model.add_constraints((lineup[p,w] <= squad_fh[p,w] + 1 - use_fh[w] for p in players for w in gameweeks), name='lineup_squad_fh_rel')
@@ -488,7 +488,11 @@ def solve_multi_period_fpl(data, options):
         model.add_constraint(so.expr_sum(use_bb[w] + use_wc[w] + use_fh[w] for w in no_chip_gws) == 0, name='no_chip_gws')
 
     # Objectives
-    gw_xp = {w: so.expr_sum(points_player_week[p,w] * (lineup[p,w] + captain[p,w] + 0.1*vicecap[p,w] + ptb_ind[p,w] + so.expr_sum(bench_weights[o] * bench[p,w,o] for o in order)) for p in players) for w in gameweeks}    
+    if options.get('use_2c', None) is None:
+        gw_xp = {w: so.expr_sum(points_player_week[p,w] * (lineup[p,w] + captain[p,w] + 0.1*vicecap[p,w] + ptb_ind[p,w] + so.expr_sum(bench_weights[o] * bench[p,w,o] for o in order)) for p in players) for w in gameweeks}    
+    else:
+        gw_xp = {w: so.expr_sum(points_player_week[p,w] * (lineup[p,w] + captain[p,w] * (2 if use_2c[w] else 1) + 0.1*vicecap[p,w] + ptb_ind[p,w] + so.expr_sum(bench_weights[o] * bench[p,w,o] for o in order)) for p in players) for w in gameweeks}    
+    
     gw_total = {w: gw_xp[w] - 4 * penalized_transfers[w] + ft_value * free_transfers[w] + itb_value * in_the_bank[w] for w in gameweeks}
     if objective == 'regular':
         total_xp = so.expr_sum(gw_total[w] for w in gameweeks)
@@ -614,7 +618,7 @@ def solve_multi_period_fpl(data, options):
             for p in players:
                 if squad[p,w].get_value() + squad_fh[p,w].get_value() + squad_lr[p,w].get_value() + transfer_out[p,w].get_value() > 0.5:
                     lp = merged_data.loc[p]
-                    is_captain = 1 if captain[p,w].get_value() > 0.5 else 0
+                    is_captain = 2 if (captain[p,w].get_value() > 0.5 and use_2c[w].get_value() > 0.5) else 1 if captain[p,w].get_value() > 0.5 else 0
                     is_squad = 1 if (use_fh[w].get_value() < 0.5 and squad[p,w].get_value() > 0.5) or (use_fh[w].get_value() > 0.5 and squad_fh[p,w].get_value() > 0.5) else 0
                     is_lineup = 1 if lineup[p,w].get_value() > 0.5 else 0
                     is_vice = 1 if vicecap[p,w].get_value() > 0.5 else 0
@@ -627,7 +631,7 @@ def solve_multi_period_fpl(data, options):
                     position = type_data.loc[lp['element_type'], 'singular_name_short']
                     player_buy_price = 0 if not is_transfer_in else buy_price[p]
                     player_sell_price = 0 if not is_transfer_out else (sell_price[p] if p in price_modified_players and transfer_out_first[p,w].get_value() > 0.5 else buy_price[p])
-                    multiplier = 1*(is_lineup==1) + 1*(is_captain==1)
+                    multiplier = 1*(is_lineup==1) + is_captain + 1*(use_ptb[w].get_value() > 0.5 and position == "FÖR")
                     xp_cont = points_player_week[p,w] * multiplier
 
                     # chip
@@ -646,8 +650,6 @@ def solve_multi_period_fpl(data, options):
                     ])
 
         picks_df = pd.DataFrame(picks, columns=['id', 'week', 'name', 'pos', 'type', 'team', 'buy_price', 'sell_price', 'xP', 'xMin', 'squad', 'lineup', 'bench', 'captain', 'vicecaptain', 'transfer_in', 'transfer_out', 'multiplier', 'xp_cont', 'chip']).sort_values(by=['week', 'lineup', 'type', 'xP'], ascending=[True, False, True, True])
-        total_xp = so.expr_sum((lineup[p,w] + captain[p,w]) * points_player_week[p,w] for p in players for w in gameweeks).get_value()
-
         picks_df.sort_values(by=['week', 'squad', 'lineup', 'bench', 'type'], ascending=[True, False, False, True, True], inplace=True)
 
         # Writing summary
@@ -673,7 +675,7 @@ def solve_multi_period_fpl(data, options):
 
             lineup_players = picks_df[(picks_df['week'] == w) & (picks_df['lineup'] == 1)]
             bench_players = picks_df[(picks_df['week'] == w) & (picks_df['bench'] >= 0)]
-
+            # print(bench_players.head())
             # captain_name = picks_df[(picks_df['week'] == w) & (picks_df['captain'] == 1)].iloc[0]['name']
             # vicecap_name = picks_df[(picks_df['week'] == w) & (picks_df['vicecaptain'] == 1)].iloc[0]['name']
 
@@ -685,11 +687,13 @@ def solve_multi_period_fpl(data, options):
             for type in [1,2,3,4]:
                 type_players = lineup_players[lineup_players['type'] == type]
                 entries = type_players.apply(get_display, axis=1)
-                print(entries.head())
                 summary_of_actions += '\t' + ', '.join(entries.tolist()) + "\n"
 
             summary_of_actions += "Bench: \n\t" + ', '.join(bench_players['name'].tolist()) + "\n"
             summary_of_actions += "Lineup xPts: " + str(round(lineup_players['xp_cont'].sum(),2)) + "\n---\n\n"
+            # summary_of_actions += "Lineup cost: " + str(round(lineup_players['xp_cont'], 2))
+            # summary_of_actions += "Bench cost: " + str(round(bench_players['xp_cont'], 2))
+            # print(bench_players.head())
             cumulative_xpts = cumulative_xpts + round(lineup_players['xp_cont'].sum(),2)
         print("Cumulative xPts: " + str(round(cumulative_xpts,2)) + "\n---\n\n")
 
@@ -706,10 +710,10 @@ def solve_multi_period_fpl(data, options):
             sell_decisions = '-'
 
         if iteration == 1:
-            return [{'iter': iter, 'model': model, 'picks': picks_df, 'total_xp': total_xp, 'summary': summary_of_actions, 'buy': buy_decisions, 'sell': sell_decisions, 'score': -model.get_objective_value()}]
+            return [{'iter': iter, 'model': model, 'picks': picks_df, 'total_xp': cumulative_xpts, 'summary': summary_of_actions, 'buy': buy_decisions, 'sell': sell_decisions, 'score': -model.get_objective_value()}]
 
         # Add current solution to a list, and add a new cut
-        solutions.append({'iter': iter, 'model': model, 'picks': picks_df, 'total_xp': total_xp, 'summary': summary_of_actions, 'buy': buy_decisions, 'sell': sell_decisions, 'score': -model.get_objective_value()})
+        solutions.append({'iter': iter, 'model': model, 'picks': picks_df, 'total_xp': cumulative_xpts, 'summary': summary_of_actions, 'buy': buy_decisions, 'sell': sell_decisions, 'score': -model.get_objective_value()})
         if iteration_criteria == 'this_gw_transfer_in':
             actions = so.expr_sum(1-transfer_in[p, next_gw] for p in players if transfer_in[p, next_gw].get_value() > 0.5) \
                     + so.expr_sum(transfer_in[p, next_gw] for p in players if transfer_in[p, next_gw].get_value() < 0.5)
