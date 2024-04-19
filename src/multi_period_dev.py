@@ -487,11 +487,7 @@ def solve_multi_period_fpl(data, options):
         no_chip_gws = options['no_chip_gws']
         model.add_constraint(so.expr_sum(use_bb[w] + use_wc[w] + use_fh[w] for w in no_chip_gws) == 0, name='no_chip_gws')
 
-    # Objectives
-    if options.get('use_2c', None) is None:
-        gw_xp = {w: so.expr_sum(points_player_week[p,w] * (lineup[p,w] + captain[p,w] + 0.1*vicecap[p,w] + ptb_ind[p,w] + so.expr_sum(bench_weights[o] * bench[p,w,o] for o in order)) for p in players) for w in gameweeks}    
-    else:
-        gw_xp = {w: so.expr_sum(points_player_week[p,w] * (lineup[p,w] + captain[p,w] * (2 if use_2c[w] else 1) + 0.1*vicecap[p,w] + ptb_ind[p,w] + so.expr_sum(bench_weights[o] * bench[p,w,o] for o in order)) for p in players) for w in gameweeks}    
+    gw_xp = {w: so.expr_sum(points_player_week[p,w] * (lineup[p,w] + captain[p,w] + (captain[p,w] if use_2c[w] == 1 else 0) + 0.1*vicecap[p,w] + ptb_ind[p,w] + so.expr_sum(bench_weights[o] * bench[p,w,o] for o in order)) for p in players) for w in gameweeks}    
     
     gw_total = {w: gw_xp[w] - 4 * penalized_transfers[w] + ft_value * free_transfers[w] + itb_value * in_the_bank[w] for w in gameweeks}
     if objective == 'regular':
